@@ -1,27 +1,99 @@
 version: "3.9"
 
 services:
-  gobank:
+  app:
     build:
       context: .
-    env_file:
-      - .env.example
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
+    environment:
+      - DATABASE_DSN=postgres://gobank:gobank@postgres:5432/gobank?sslmode=disable
+      - REDIS_ADDR=redis:6379
+      - NATS_URL=nats://nats:4222
+      - JWT_ACCESS_SECRET=local-dev-access-secret-32-chars!
+      - JWT_REFRESH_SECRET=local-dev-refresh-secret-32chars!
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - gobank-net
 
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: gobank
       POSTGRES_USER: gobank
       POSTGRES_PASSWORD: gobank
+      POSTGRES_DB: gobank
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gobank -d gobank"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - gobank-net
 
   redis:
     image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - gobank-net
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats_data:/data
+    networks:
+      - gobank-net
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ./deployments/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - gobank-net
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    networks:
+      - gobank-net
+
+volumes:
+  postgres_data:
+  redis_data:
+  nats_data:
+  prometheus_data:
+
+networks:
+  gobank-net:
+    driver: bridge

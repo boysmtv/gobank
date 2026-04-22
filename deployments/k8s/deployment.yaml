@@ -2,23 +2,88 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gobank
+  namespace: banking
+  labels:
+    app: gobank
+    version: v1
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: gobank
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
         app: gobank
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
+      serviceAccountName: gobank-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      terminationGracePeriodSeconds: 60
       containers:
         - name: gobank
-          image: gobank:latest
+          image: yourregistry/gobank:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
+              name: http
+              protocol: TCP
+            - containerPort: 9090
+              name: grpc
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: gobank-config
             - secretRef:
-                name: gobank-secret
+                name: gobank-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: gobank

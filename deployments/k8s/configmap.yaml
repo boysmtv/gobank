@@ -2,7 +2,10 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: gobank-config
+  namespace: banking
 data:
-  APP_NAME: gobank
-  APP_ENV: production
-  HTTP_PORT: "8080"
+  APP_ENV: "production"
+  APP_PORT: "8080"
+  REDIS_ADDR: "redis-service:6379"
+  NATS_URL: "nats://nats-service:4222"
+  JAEGER_ENDPOINT: "http://jaeger-service:14268/api/traces"

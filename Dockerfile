@@ -1,37 +1,37 @@
-# ====== BUILDER ======
+# ----- Build stage -----
 FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
-# install git (penting untuk beberapa dependency)
-RUN apk add --no-cache git
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata
 
-# copy go mod dulu (biar cache optimal)
+# Download dependencies first (cache layer)
 COPY go.mod go.sum ./
 RUN go mod download
 
-# copy source code
 COPY . .
 
-# build binary (static biar ringan)
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o gobank ./cmd/server
+# Build with optimizations
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-w -s -X main.Version=$(git describe --tags --always --dirty)" \
+    -o /bin/gobank ./cmd/server
 
-# ====== RUNNER ======
-FROM alpine:3.20
+# ----- Runtime stage -----
+FROM scratch
 
-WORKDIR /app
+# Import ca-certs and timezone data from builder
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
-# install cert (penting untuk HTTPS, JWT, dll)
-RUN apk add --no-cache ca-certificates
+# Copy binary
+COPY --from=builder /bin/gobank /gobank
 
-# copy binary
-COPY --from=builder /app/gobank /app/gobank
+# Copy config (can be overridden by ConfigMap)
+COPY --from=builder /app/configs/config.yaml /configs/config.yaml
 
-# copy config
-COPY --from=builder /app/configs/config.yaml /app/configs/config.yaml
+EXPOSE 8080 9090
 
-# expose port
-EXPOSE 8080
+USER 65534:65534
 
-# run app
-CMD ["/app/gobank"]
+ENTRYPOINT ["/gobank"]
