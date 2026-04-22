@@ -1,5 +1,39 @@
-app_name: gobank
-app_env: development
-http_port: 8080
-jwt_secret: super-secret-key
-password_pepper: change-me
+app:
+  name: gobank
+  env: development
+  port: 8080
+  grpc_port: 9090
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 120s
+
+database:
+  dsn: "postgres://gobank:gobank@localhost:5432/gobank?sslmode=disable"
+  max_open_conns: 25
+  max_idle_conns: 10
+  conn_max_lifetime: 5m
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+nats:
+  url: "nats://localhost:4222"
+
+jwt:
+  access_secret: "change-me-access-secret-32-chars!!"
+  refresh_secret: "change-me-refresh-secret-32chars!"
+  access_expiry: 15m
+  refresh_expiry: 168h
+
+argon2:
+  memory: 65536
+  iterations: 3
+  parallelism: 2
+  salt_length: 16
+  key_length: 32
+
+tracer:
+  jaeger_endpoint: "http://localhost:14268/api/traces"
+  service_name: "gobank"

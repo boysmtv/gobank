@@ -1,50 +1,25 @@
 package circuitbreaker
 
 import (
-	"errors"
-	"sync"
+	"fmt"
 	"time"
+
+	"github.com/sony/gobreaker"
 )
 
-var ErrCircuitOpen = errors.New("circuit is open")
-
-type Breaker struct {
-	mu        sync.Mutex
-	failures  int
-	threshold int
-	openUntil time.Time
-	cooldown  time.Duration
-}
-
-func New(threshold int, cooldown time.Duration) *Breaker {
-	return &Breaker{
-		threshold: threshold,
-		cooldown:  cooldown,
-	}
-}
-
-func (b *Breaker) Do(fn func() error) error {
-	b.mu.Lock()
-	if time.Now().Before(b.openUntil) {
-		b.mu.Unlock()
-		return ErrCircuitOpen
-	}
-	b.mu.Unlock()
-
-	err := fn()
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if err != nil {
-		b.failures++
-		if b.failures >= b.threshold {
-			b.openUntil = time.Now().Add(b.cooldown)
-		}
-		return err
-	}
-
-	b.failures = 0
-	b.openUntil = time.Time{}
-	return nil
+// New creates a circuit breaker suitable for wrapping external calls (DB, Redis, NATS).
+func New(name string) *gobreaker.CircuitBreaker {
+	return gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        name,
+		MaxRequests: 3,
+		Interval:    10 * time.Second,
+		Timeout:     30 * time.Second,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 5 && failureRatio >= 0.6
+		},
+		OnStateChange: func(name string, from, to gobreaker.State) {
+			fmt.Printf("circuit breaker %q: %s → %s\n", name, from, to)
+		},
+	})
 }
