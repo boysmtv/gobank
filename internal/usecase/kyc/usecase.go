@@ -2,103 +2,102 @@ package kyc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"gobank/internal/domain"
-	"gobank/internal/repository"
+	"github.com/google/uuid"
+	"github.com/yourorg/gobank/internal/domain"
+	"github.com/yourorg/gobank/internal/messaging"
+	"github.com/yourorg/gobank/internal/repository"
+	"github.com/yourorg/gobank/internal/repository/postgres"
+	"go.uber.org/zap"
 )
 
 type UseCase struct {
-	kyc    repository.KYCRepository
-	users  repository.UserRepository
-	audits repository.AuditRepository
+	kycRepo   repository.KYCRepository
+	userRepo  repository.UserRepository
+	publisher messaging.Publisher
+	log       *zap.Logger
 }
 
-type SubmitInput struct {
-	UserID         string
-	DocumentType   string
-	DocumentNumber string
+func New(kycRepo repository.KYCRepository, userRepo repository.UserRepository, publisher messaging.Publisher, log *zap.Logger) *UseCase {
+	return &UseCase{kycRepo: kycRepo, userRepo: userRepo, publisher: publisher, log: log}
 }
 
-func NewUseCase(
-	kyc repository.KYCRepository,
-	users repository.UserRepository,
-	audits repository.AuditRepository,
-) *UseCase {
-	return &UseCase{
-		kyc:    kyc,
-		users:  users,
-		audits: audits,
+func (uc *UseCase) Submit(ctx context.Context, userID uuid.UUID, req domain.KYCSubmitRequest) (*domain.KYCRecord, error) {
+	existing, err := uc.kycRepo.GetByUserID(ctx, userID)
+	if err != nil && !errors.Is(err, postgres.ErrNotFound) {
+		return nil, err
 	}
-}
-
-func (u *UseCase) Submit(ctx context.Context, input SubmitInput) (domain.KYCSubmission, error) {
-	now := time.Now().UTC()
-	submission := domain.KYCSubmission{
-		ID:             fmt.Sprintf("kyc_%d", now.UnixNano()),
-		UserID:         input.UserID,
-		DocumentType:   input.DocumentType,
-		DocumentNumber: input.DocumentNumber,
-		Status:         domain.KYCStatusReview,
-		SubmittedAt:    now,
+	if existing != nil && existing.Status == domain.KYCStatusVerified {
+		return nil, ErrAlreadyVerified
 	}
 
-	created, err := u.kyc.Create(ctx, submission)
+	dob, err := time.Parse("2006-01-02", req.DateOfBirth)
 	if err != nil {
-		return domain.KYCSubmission{}, err
-	}
-
-	user, err := u.users.FindByID(ctx, input.UserID)
-	if err == nil {
-		user.KYCStatus = domain.KYCStatusReview
-		user.UpdatedAt = now
-		_, _ = u.users.Update(ctx, user)
-	}
-
-	_ = u.audits.Create(ctx, domain.AuditLog{
-		ID:         fmt.Sprintf("aud_%d", now.UnixNano()),
-		ActorID:    input.UserID,
-		Action:     "kyc.submitted",
-		Resource:   "kyc",
-		ResourceID: created.ID,
-		CreatedAt:  now,
-	})
-
-	return created, nil
-}
-
-func (u *UseCase) Approve(ctx context.Context, userID, notes string) (domain.KYCSubmission, error) {
-	submission, err := u.kyc.FindByUserID(ctx, userID)
-	if err != nil {
-		return domain.KYCSubmission{}, err
+		return nil, fmt.Errorf("invalid date of birth: %w", err)
 	}
 
 	now := time.Now().UTC()
-	submission.Status = domain.KYCStatusApproved
-	submission.Notes = notes
-	submission.ReviewedAt = &now
-
-	updated, err := u.kyc.Update(ctx, submission)
-	if err != nil {
-		return domain.KYCSubmission{}, err
+	record := &domain.KYCRecord{
+		ID:            uuid.New(),
+		UserID:        userID,
+		FullLegalName: req.FullLegalName,
+		DateOfBirth:   dob,
+		NationalID:    req.NationalID,
+		Address:       req.Address,
+		Status:        domain.KYCStatusPending,
+		SubmittedAt:   now,
 	}
 
-	user, err := u.users.FindByID(ctx, userID)
-	if err == nil {
-		user.KYCStatus = domain.KYCStatusApproved
-		user.UpdatedAt = now
-		_, _ = u.users.Update(ctx, user)
+	if existing != nil {
+		// Re-submission: update status back to pending
+		if err := uc.kycRepo.UpdateStatus(ctx, userID, domain.KYCStatusPending, ""); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := uc.kycRepo.Create(ctx, record); err != nil {
+			return nil, err
+		}
 	}
 
-	_ = u.audits.Create(ctx, domain.AuditLog{
-		ID:         fmt.Sprintf("aud_%d", now.UnixNano()),
-		ActorID:    userID,
-		Action:     "kyc.approved",
-		Resource:   "kyc",
-		ResourceID: updated.ID,
-		CreatedAt:  now,
+	// Activate user on KYC submission
+	_ = uc.userRepo.UpdateStatus(ctx, userID, domain.UserStatusActive)
+
+	_ = uc.publisher.Publish(ctx, messaging.SubjectAudit, domain.AuditEvent{
+		AuditLog: domain.AuditLog{
+			ID:         uuid.New(),
+			UserID:     &userID,
+			Action:     domain.AuditActionKYCSubmitted,
+			ResourceID: record.ID.String(),
+			CreatedAt:  now,
+		},
 	})
 
-	return updated, nil
+	return record, nil
 }
+
+func (uc *UseCase) GetStatus(ctx context.Context, userID uuid.UUID) (*domain.KYCRecord, error) {
+	return uc.kycRepo.GetByUserID(ctx, userID)
+}
+
+// Verify is an admin-only action to mark KYC as verified.
+func (uc *UseCase) Verify(ctx context.Context, adminID, targetUserID uuid.UUID) error {
+	if err := uc.kycRepo.UpdateStatus(ctx, targetUserID, domain.KYCStatusVerified, ""); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	_ = uc.publisher.Publish(ctx, messaging.SubjectAudit, domain.AuditEvent{
+		AuditLog: domain.AuditLog{
+			ID:         uuid.New(),
+			UserID:     &adminID,
+			Action:     domain.AuditActionKYCVerified,
+			ResourceID: targetUserID.String(),
+			CreatedAt:  now,
+		},
+	})
+	return nil
+}
+
+var ErrAlreadyVerified = errors.New("KYC already verified")

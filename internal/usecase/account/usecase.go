@@ -4,71 +4,111 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"strconv"
 	"time"
 
-	"gobank/internal/domain"
-	"gobank/internal/repository"
+	"github.com/google/uuid"
+	"github.com/yourorg/gobank/internal/domain"
+	"github.com/yourorg/gobank/internal/messaging"
+	"github.com/yourorg/gobank/internal/repository"
+	"go.uber.org/zap"
 )
 
-var ErrCurrencyRequired = errors.New("currency is required")
-
 type UseCase struct {
-	accounts repository.AccountRepository
-	audits   repository.AuditRepository
+	accountRepo repository.AccountRepository
+	publisher   messaging.Publisher
+	log         *zap.Logger
 }
 
-type CreateInput struct {
-	UserID   string
-	Type     domain.AccountType
-	Currency string
+func New(accountRepo repository.AccountRepository, publisher messaging.Publisher, log *zap.Logger) *UseCase {
+	return &UseCase{accountRepo: accountRepo, publisher: publisher, log: log}
 }
 
-func NewUseCase(accounts repository.AccountRepository, audits repository.AuditRepository) *UseCase {
-	return &UseCase{
-		accounts: accounts,
-		audits:   audits,
+func (uc *UseCase) CreateAccount(ctx context.Context, userID uuid.UUID, req domain.CreateAccountRequest) (*domain.Account, error) {
+	existing, err := uc.accountRepo.ListByUserID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("listing accounts: %w", err)
 	}
-}
-
-func (u *UseCase) Create(ctx context.Context, input CreateInput) (domain.Account, error) {
-	if input.Currency == "" {
-		return domain.Account{}, ErrCurrencyRequired
+	if len(existing) >= 5 {
+		return nil, ErrMaxAccountsReached
 	}
 
 	now := time.Now().UTC()
-	account := domain.Account{
-		ID:        fmt.Sprintf("acc_%d", now.UnixNano()),
-		UserID:    input.UserID,
-		Number:    fmt.Sprintf("10%d", now.UnixNano()),
-		Type:      input.Type,
-		Currency:  input.Currency,
-		Balance:   0,
-		Active:    true,
-		CreatedAt: now,
-		UpdatedAt: now,
+	acct := &domain.Account{
+		ID:            uuid.New(),
+		UserID:        userID,
+		AccountNumber: generateAccountNumber(),
+		Type:          req.Type,
+		Currency:      req.Currency,
+		Balance:       0,
+		Status:        domain.AccountStatusActive,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 
-	created, err := u.accounts.Create(ctx, account)
-	if err != nil {
-		return domain.Account{}, err
+	if err := uc.accountRepo.Create(ctx, acct); err != nil {
+		return nil, fmt.Errorf("creating account: %w", err)
 	}
 
-	_ = u.audits.Create(ctx, domain.AuditLog{
-		ID:         fmt.Sprintf("aud_%d", now.UnixNano()),
-		ActorID:    input.UserID,
-		Action:     "account.created",
-		Resource:   "account",
-		ResourceID: created.ID,
-		CreatedAt:  now,
+	_ = uc.publisher.Publish(ctx, messaging.SubjectAudit, domain.AuditEvent{
+		AuditLog: domain.AuditLog{
+			ID:         uuid.New(),
+			UserID:     &userID,
+			Action:     domain.AuditActionAccountCreated,
+			ResourceID: acct.ID.String(),
+			Metadata:   map[string]string{"account_number": acct.AccountNumber, "type": string(acct.Type)},
+			CreatedAt:  now,
+		},
 	})
 
-	return created, nil
+	return acct, nil
 }
 
-func (u *UseCase) GetByID(ctx context.Context, id string) (domain.Account, error) {
-	return u.accounts.FindByID(ctx, id)
+func (uc *UseCase) GetAccount(ctx context.Context, userID, accountID uuid.UUID) (*domain.Account, error) {
+	acct, err := uc.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	// Ensure ownership
+	if acct.UserID != userID {
+		return nil, ErrForbidden
+	}
+	return acct, nil
 }
 
-func (u *UseCase) ListByUser(ctx context.Context, userID string) ([]domain.Account, error) {
-	return u.accounts.FindByUserID(ctx, userID)
+func (uc *UseCase) ListAccounts(ctx context.Context, userID uuid.UUID) ([]domain.Account, error) {
+	return uc.accountRepo.ListByUserID(ctx, userID)
 }
+
+// generateAccountNumber creates a unique 12-digit account number with a checksum.
+func generateAccountNumber() string {
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	prefix := "9900"
+	suffix := fmt.Sprintf("%08d", rng.Intn(100000000))
+	num := prefix + suffix
+	return addLuhnCheckDigit(num)
+}
+
+func addLuhnCheckDigit(number string) string {
+	sum := 0
+	nDigits := len(number)
+	parity := nDigits % 2
+	for i := 0; i < nDigits; i++ {
+		digit, _ := strconv.Atoi(string(number[i]))
+		if i%2 == parity {
+			digit *= 2
+			if digit > 9 {
+				digit -= 9
+			}
+		}
+		sum += digit
+	}
+	checkDigit := (10 - (sum % 10)) % 10
+	return number + strconv.Itoa(checkDigit)
+}
+
+var (
+	ErrMaxAccountsReached = errors.New("maximum accounts per user reached")
+	ErrForbidden          = errors.New("access forbidden")
+)

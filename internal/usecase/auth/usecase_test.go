@@ -1,117 +1,192 @@
-package auth
+package auth_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
-	"gobank/internal/domain"
+	"github.com/google/uuid"
+	"github.com/yourorg/gobank/internal/domain"
+	"github.com/yourorg/gobank/internal/repository/postgres"
+	authUC "github.com/yourorg/gobank/internal/usecase/auth"
+	"github.com/yourorg/gobank/pkg/jwt"
+	"github.com/yourorg/gobank/pkg/password"
+	"go.uber.org/zap"
 )
 
+// --- Mock implementations ---
+
 type mockUserRepo struct {
-	users map[string]domain.User
+	users  map[string]*domain.User
+	tokens map[uuid.UUID]*domain.RefreshToken
 }
 
-func (m *mockUserRepo) Create(_ context.Context, user domain.User) (domain.User, error) {
-	if m.users == nil {
-		m.users = make(map[string]domain.User)
+func newMockUserRepo() *mockUserRepo {
+	return &mockUserRepo{
+		users:  make(map[string]*domain.User),
+		tokens: make(map[uuid.UUID]*domain.RefreshToken),
 	}
-	m.users[user.Email] = user
-	return user, nil
 }
 
-func (m *mockUserRepo) FindByID(_ context.Context, id string) (domain.User, error) {
-	for _, user := range m.users {
-		if user.ID == id {
-			return user, nil
+func (m *mockUserRepo) Create(ctx context.Context, user *domain.User) error {
+	m.users[user.Email] = user
+	return nil
+}
+
+func (m *mockUserRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
+	for _, u := range m.users {
+		if u.ID == id {
+			return u, nil
 		}
 	}
-	return domain.User{}, errors.New("not found")
+	return nil, postgres.ErrNotFound
 }
 
-func (m *mockUserRepo) FindByEmail(_ context.Context, email string) (domain.User, error) {
-	user, ok := m.users[email]
+func (m *mockUserRepo) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
+	u, ok := m.users[email]
 	if !ok {
-		return domain.User{}, errors.New("not found")
+		return nil, postgres.ErrNotFound
 	}
-	return user, nil
+	return u, nil
 }
 
-func (m *mockUserRepo) Update(_ context.Context, user domain.User) (domain.User, error) {
-	m.users[user.Email] = user
-	return user, nil
-}
-
-type mockAuditRepo struct{}
-
-func (m *mockAuditRepo) Create(context.Context, domain.AuditLog) error {
+func (m *mockUserRepo) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.UserStatus) error {
 	return nil
 }
 
-func (m *mockAuditRepo) List(context.Context, string) ([]domain.AuditLog, error) {
-	return nil, nil
+func (m *mockUserRepo) SaveRefreshToken(ctx context.Context, token *domain.RefreshToken) error {
+	m.tokens[token.ID] = token
+	return nil
 }
 
-type mockHasher struct{}
-
-func (m *mockHasher) Hash(raw string) (string, error) {
-	return "hash:" + raw, nil
+func (m *mockUserRepo) GetRefreshToken(ctx context.Context, id uuid.UUID) (*domain.RefreshToken, error) {
+	t, ok := m.tokens[id]
+	if !ok {
+		return nil, postgres.ErrNotFound
+	}
+	return t, nil
 }
 
-func (m *mockHasher) Compare(raw, hashed string) error {
-	if hashed != "hash:"+raw {
-		return errors.New("mismatch")
+func (m *mockUserRepo) RevokeRefreshToken(ctx context.Context, id uuid.UUID) error {
+	if t, ok := m.tokens[id]; ok {
+		t.Revoked = true
 	}
 	return nil
 }
 
-type mockTokenManager struct{}
-
-func (m *mockTokenManager) Generate(subject string) (string, error) {
-	return "token:" + subject, nil
+func (m *mockUserRepo) RevokeAllUserRefreshTokens(ctx context.Context, userID uuid.UUID) error {
+	for _, t := range m.tokens {
+		if t.UserID == userID {
+			t.Revoked = true
+		}
+	}
+	return nil
 }
 
-func TestRegister(t *testing.T) {
-	uc := NewUseCase(&mockUserRepo{}, &mockAuditRepo{}, &mockHasher{}, &mockTokenManager{})
+type mockPublisher struct{}
 
-	user, err := uc.Register(context.Background(), RegisterInput{
-		Email:    "john@example.com",
-		FullName: "John Doe",
-		Password: "secret",
-	})
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
+func (m *mockPublisher) Publish(ctx context.Context, subject string, payload interface{}) error {
+	return nil
+}
+
+// --- Tests ---
+
+func newTestUseCase(repo *mockUserRepo) *authUC.UseCase {
+	jwtMgr := jwt.NewManager("test-access-secret-32-characters!!", "test-refresh-secret-32-characters!", 15*time.Minute, 7*24*time.Hour)
+	argon := password.DefaultParams
+	log, _ := zap.NewDevelopment()
+	return authUC.New(repo, jwtMgr, argon, &mockPublisher{}, log)
+}
+
+func TestRegister_Success(t *testing.T) {
+	repo := newMockUserRepo()
+	uc := newTestUseCase(repo)
+
+	req := domain.RegisterRequest{
+		Email:    "alice@example.com",
+		Password: "securepassword123",
+		FullName: "Alice Smith",
+		Phone:    "+12025550100",
 	}
 
-	if user.Email != "john@example.com" {
-		t.Fatalf("expected email to be stored")
+	user, err := uc.Register(context.Background(), req, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if user.Email != req.Email {
+		t.Errorf("expected email %s, got %s", req.Email, user.Email)
+	}
+	if user.PasswordHash == req.Password {
+		t.Error("password should be hashed")
 	}
 }
 
-func TestLogin(t *testing.T) {
-	repo := &mockUserRepo{
-		users: map[string]domain.User{
-			"john@example.com": {
-				ID:           "usr_1",
-				Email:        "john@example.com",
-				PasswordHash: "hash:secret",
-				CreatedAt:    time.Now(),
-				UpdatedAt:    time.Now(),
-			},
-		},
-	}
-	uc := NewUseCase(repo, &mockAuditRepo{}, &mockHasher{}, &mockTokenManager{})
+func TestRegister_DuplicateEmail(t *testing.T) {
+	repo := newMockUserRepo()
+	uc := newTestUseCase(repo)
 
-	token, err := uc.Login(context.Background(), LoginInput{
-		Email:    "john@example.com",
-		Password: "secret",
-	})
+	req := domain.RegisterRequest{
+		Email:    "bob@example.com",
+		Password: "password123",
+		FullName: "Bob",
+		Phone:    "+12025550101",
+	}
+
+	_, err := uc.Register(context.Background(), req, "127.0.0.1")
 	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
+		t.Fatal(err)
 	}
 
-	if token != "token:usr_1" {
-		t.Fatalf("unexpected token %q", token)
+	_, err = uc.Register(context.Background(), req, "127.0.0.1")
+	if err != authUC.ErrEmailTaken {
+		t.Errorf("expected ErrEmailTaken, got: %v", err)
+	}
+}
+
+func TestLogin_InvalidCredentials(t *testing.T) {
+	repo := newMockUserRepo()
+	uc := newTestUseCase(repo)
+
+	req := domain.LoginRequest{
+		Email:    "nobody@example.com",
+		Password: "wrong",
+	}
+
+	_, err := uc.Login(context.Background(), req, "127.0.0.1", "test-agent")
+	if err != authUC.ErrInvalidCredentials {
+		t.Errorf("expected ErrInvalidCredentials, got: %v", err)
+	}
+}
+
+func TestLogin_Success_And_Refresh(t *testing.T) {
+	repo := newMockUserRepo()
+	uc := newTestUseCase(repo)
+
+	regReq := domain.RegisterRequest{
+		Email:    "carol@example.com",
+		Password: "mypassword123",
+		FullName: "Carol",
+		Phone:    "+12025550102",
+	}
+	_, err := uc.Register(context.Background(), regReq, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loginReq := domain.LoginRequest{Email: regReq.Email, Password: regReq.Password}
+	tokens, err := uc.Login(context.Background(), loginReq, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+	if tokens.AccessToken == "" || tokens.RefreshToken == "" {
+		t.Fatal("expected non-empty tokens")
+	}
+
+	newTokens, err := uc.RefreshTokens(context.Background(), tokens.RefreshToken)
+	if err != nil {
+		t.Fatalf("refresh failed: %v", err)
+	}
+	if newTokens.AccessToken == tokens.AccessToken {
+		t.Error("new access token should differ from old")
 	}
 }
