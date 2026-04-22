@@ -1,0 +1,5 @@
+app_name: gobank
+app_env: development
+http_port: 8080
+jwt_secret: super-secret-key
+password_pepper: change-me

@@ -1,0 +1,10 @@
+http:
+  routers:
+    gobank:
+      rule: Host(`gobank.local`)
+      service: gobank
+  services:
+    gobank:
+      loadBalancer:
+        servers:
+          - url: http://gobank:8080

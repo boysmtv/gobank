@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gobank
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gobank
+  template:
+    metadata:
+      labels:
+        app: gobank
+    spec:
+      containers:
+        - name: gobank
+          image: gobank:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: gobank-config
+            - secretRef:
+                name: gobank-secret

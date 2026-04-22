@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gobank-config
+data:
+  APP_NAME: gobank
+  APP_ENV: production
+  HTTP_PORT: "8080"
