@@ -1,76 +1,115 @@
 package jwt
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
+
+	jwtlib "github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
+type TokenType string
+
+const (
+	TypeAccess  TokenType = "access"
+	TypeRefresh TokenType = "refresh"
+)
+
+type Claims struct {
+	jwtlib.RegisteredClaims
+	UserID    string    `json:"uid"`
+	Role      string    `json:"role"`
+	TokenType TokenType `json:"type"`
+	TokenID   string    `json:"jti"`
+}
+
 type Manager struct {
-	secret []byte
-	ttl    time.Duration
+	accessSecret  []byte
+	refreshSecret []byte
+	accessExpiry  time.Duration
+	refreshExpiry time.Duration
 }
 
-func NewManager(secret string, ttl time.Duration) *Manager {
+func NewManager(accessSecret, refreshSecret string, accessExpiry, refreshExpiry time.Duration) *Manager {
 	return &Manager{
-		secret: []byte(secret),
-		ttl:    ttl,
+		accessSecret:  []byte(accessSecret),
+		refreshSecret: []byte(refreshSecret),
+		accessExpiry:  accessExpiry,
+		refreshExpiry: refreshExpiry,
 	}
 }
 
-func (m *Manager) Generate(subject string) (string, error) {
-	expiresAt := time.Now().Add(m.ttl).Unix()
-	payload := fmt.Sprintf("%s:%d", subject, expiresAt)
-
-	mac := hmac.New(sha256.New, m.secret)
-	if _, err := mac.Write([]byte(payload)); err != nil {
-		return "", err
+func (m *Manager) GenerateAccessToken(userID uuid.UUID, role string) (string, time.Time, error) {
+	expiry := time.Now().Add(m.accessExpiry)
+	claims := &Claims{
+		RegisteredClaims: jwtlib.RegisteredClaims{
+			IssuedAt:  jwtlib.NewNumericDate(time.Now()),
+			ExpiresAt: jwtlib.NewNumericDate(expiry),
+			Issuer:    "gobank",
+		},
+		UserID:    userID.String(),
+		Role:      role,
+		TokenType: TypeAccess,
+		TokenID:   uuid.New().String(),
 	}
-
-	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	token := base64.RawURLEncoding.EncodeToString([]byte(payload))
-
-	return token + "." + signature, nil
+	token := jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims)
+	signed, err := token.SignedString(m.accessSecret)
+	return signed, expiry, err
 }
 
-func (m *Manager) Validate(token string) (string, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 2 {
-		return "", errors.New("invalid token format")
+func (m *Manager) GenerateRefreshToken(userID uuid.UUID, role string) (string, uuid.UUID, time.Time, error) {
+	tokenID := uuid.New()
+	expiry := time.Now().Add(m.refreshExpiry)
+	claims := &Claims{
+		RegisteredClaims: jwtlib.RegisteredClaims{
+			IssuedAt:  jwtlib.NewNumericDate(time.Now()),
+			ExpiresAt: jwtlib.NewNumericDate(expiry),
+			Issuer:    "gobank",
+		},
+		UserID:    userID.String(),
+		Role:      role,
+		TokenType: TypeRefresh,
+		TokenID:   tokenID.String(),
 	}
+	token := jwtlib.NewWithClaims(jwtlib.SigningMethodHS256, claims)
+	signed, err := token.SignedString(m.refreshSecret)
+	return signed, tokenID, expiry, err
+}
 
-	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+func (m *Manager) ValidateAccessToken(tokenString string) (*Claims, error) {
+	return m.validate(tokenString, m.accessSecret, TypeAccess)
+}
+
+func (m *Manager) ValidateRefreshToken(tokenString string) (*Claims, error) {
+	return m.validate(tokenString, m.refreshSecret, TypeRefresh)
+}
+
+func (m *Manager) validate(tokenString string, secret []byte, expectedType TokenType) (*Claims, error) {
+	token, err := jwtlib.ParseWithClaims(tokenString, &Claims{}, func(t *jwtlib.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwtlib.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return secret, nil
+	})
 	if err != nil {
-		return "", errors.New("invalid token payload")
+		if errors.Is(err, jwtlib.ErrTokenExpired) {
+			return nil, ErrExpired
+		}
+		return nil, ErrInvalid
 	}
 
-	mac := hmac.New(sha256.New, m.secret)
-	if _, err := mac.Write(payload); err != nil {
-		return "", err
+	claims, ok := token.Claims.(*Claims)
+	if !ok || !token.Valid {
+		return nil, ErrInvalid
 	}
-
-	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(parts[1])) {
-		return "", errors.New("invalid token signature")
+	if claims.TokenType != expectedType {
+		return nil, ErrInvalid
 	}
-
-	values := strings.Split(string(payload), ":")
-	if len(values) != 2 {
-		return "", errors.New("invalid token claims")
-	}
-
-	expiresAt, err := strconv.ParseInt(values[1], 10, 64)
-	if err != nil {
-		return "", errors.New("invalid token expiry")
-	}
-	if time.Now().Unix() > expiresAt {
-		return "", errors.New("token expired")
-	}
-
-	return values[0], nil
+	return claims, nil
 }
+
+var (
+	ErrExpired = errors.New("token expired")
+	ErrInvalid = errors.New("token invalid")
+)
