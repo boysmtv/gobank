@@ -4,47 +4,80 @@ import (
 	"encoding/json"
 	"net/http"
 
-	kycuc "gobank/internal/usecase/kyc"
-	"gobank/pkg/response"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+	"github.com/yourorg/gobank/internal/delivery/http/middleware"
+	"github.com/yourorg/gobank/internal/domain"
+	kycUC "github.com/yourorg/gobank/internal/usecase/kyc"
+	"github.com/yourorg/gobank/pkg/response"
 )
 
 type KYCHandler struct {
-	usecase *kycuc.UseCase
+	uc       *kycUC.UseCase
+	validate *validator.Validate
 }
 
-func NewKYCHandler(usecase *kycuc.UseCase) *KYCHandler {
-	return &KYCHandler{usecase: usecase}
+func NewKYCHandler(uc *kycUC.UseCase) *KYCHandler {
+	return &KYCHandler{uc: uc, validate: validator.New()}
 }
 
 func (h *KYCHandler) Submit(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		response.Error(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
+	userIDStr, _ := middleware.UserIDFromContext(r.Context())
+	userID, _ := uuid.Parse(userIDStr)
 
-	var req struct {
-		UserID         string `json:"user_id"`
-		DocumentType   string `json:"document_type"`
-		DocumentNumber string `json:"document_number"`
-	}
-
+	var req domain.KYCSubmitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.Error(w, http.StatusBadRequest, "invalid request body")
+		response.JSONError(w, http.StatusBadRequest, "INVALID_BODY", "invalid request body")
+		return
+	}
+	if err := h.validate.Struct(req); err != nil {
+		response.JSONError(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", err.Error())
 		return
 	}
 
-	result, err := h.usecase.Submit(r.Context(), kycuc.SubmitInput{
-		UserID:         req.UserID,
-		DocumentType:   req.DocumentType,
-		DocumentNumber: req.DocumentNumber,
-	})
+	record, err := h.uc.Submit(r.Context(), userID, req)
 	if err != nil {
-		response.Error(w, http.StatusBadRequest, err.Error())
+		if err == kycUC.ErrAlreadyVerified {
+			response.JSONError(w, http.StatusConflict, "ALREADY_VERIFIED", err.Error())
+			return
+		}
+		response.JSONError(w, http.StatusInternalServerError, "INTERNAL", "KYC submission failed")
 		return
 	}
 
-	response.JSON(w, http.StatusCreated, response.Envelope{
-		"success": true,
-		"data":    result,
-	})
+	response.JSON(w, http.StatusCreated, record)
+}
+
+func (h *KYCHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
+	userIDStr, _ := middleware.UserIDFromContext(r.Context())
+	userID, _ := uuid.Parse(userIDStr)
+
+	record, err := h.uc.GetStatus(r.Context(), userID)
+	if err != nil {
+		response.JSONError(w, http.StatusNotFound, "NOT_FOUND", "KYC record not found")
+		return
+	}
+
+	response.JSON(w, http.StatusOK, record)
+}
+
+func (h *KYCHandler) AdminVerify(w http.ResponseWriter, r *http.Request) {
+	adminIDStr, _ := middleware.UserIDFromContext(r.Context())
+	adminID, _ := uuid.Parse(adminIDStr)
+
+	var body struct {
+		UserID string `json:"user_id" validate:"required,uuid"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		response.JSONError(w, http.StatusBadRequest, "INVALID_BODY", "invalid body")
+		return
+	}
+	targetID, _ := uuid.Parse(body.UserID)
+
+	if err := h.uc.Verify(r.Context(), adminID, targetID); err != nil {
+		response.JSONError(w, http.StatusInternalServerError, "INTERNAL", "verification failed")
+		return
+	}
+
+	response.JSON(w, http.StatusOK, map[string]string{"status": "verified"})
 }

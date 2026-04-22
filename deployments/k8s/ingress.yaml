@@ -1,16 +1,25 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: gobank
+  name: gobank-ingress
+  namespace: banking
+  annotations:
+    kubernetes.io/ingress.class: "traefik"
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
 spec:
+  tls:
+    - hosts:
+        - api.gobank.io
+      secretName: gobank-tls
   rules:
-    - host: gobank.local
+    - host: api.gobank.io
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: gobank
+                name: gobank-service
                 port:
                   number: 80

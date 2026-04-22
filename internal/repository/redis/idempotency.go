@@ -2,36 +2,37 @@ package redis
 
 import (
 	"context"
-	"sync"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
-type IdempotencyRepository struct {
-	mu   sync.Mutex
-	keys map[string]struct{}
+type IdempotencyStore struct {
+	client *redis.Client
+	prefix string
 }
 
-func NewIdempotencyRepository() *IdempotencyRepository {
-	return &IdempotencyRepository{
-		keys: make(map[string]struct{}),
+func NewIdempotencyStore(client *redis.Client) *IdempotencyStore {
+	return &IdempotencyStore{client: client, prefix: "idem:"}
+}
+
+// Set stores key-value pair with TTL using SET NX (atomic, no-overwrite).
+func (s *IdempotencyStore) Set(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	result, err := s.client.SetNX(ctx, s.prefix+key, value, ttl).Result()
+	if err != nil {
+		return false, err
 	}
+	return result, nil
 }
 
-func (r *IdempotencyRepository) Reserve(_ context.Context, key string) (bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if _, exists := r.keys[key]; exists {
-		return false, nil
+func (s *IdempotencyStore) Get(ctx context.Context, key string) ([]byte, error) {
+	val, err := s.client.Get(ctx, s.prefix+key).Bytes()
+	if err == redis.Nil {
+		return nil, nil
 	}
-
-	r.keys[key] = struct{}{}
-	return true, nil
+	return val, err
 }
 
-func (r *IdempotencyRepository) Release(_ context.Context, key string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	delete(r.keys, key)
-	return nil
+func (s *IdempotencyStore) Delete(ctx context.Context, key string) error {
+	return s.client.Del(ctx, s.prefix+key).Err()
 }
