@@ -1,1 +1,1 @@
-DROP TABLE IF EXISTS kyc_submissions;
+DROP TABLE IF EXISTS kyc_records;
